@@ -1,4 +1,5 @@
 import re
+import time
 import requests
 import pandas as pd
 import streamlit as st
@@ -70,15 +71,78 @@ def compute_by_year(df, total_cols, elderly_cols, names):
 all_years = compute_by_year(raw_df, total_cols, elderly_cols, names)
 
 years = sorted(all_years["연도"].unique().tolist())
-latest_year = years[-1]
+latest_idx = len(years) - 1
 
-# ── 사이드바: 연도 선택 · 시도 필터 · 시군구 검색 ──
+# ── 세션 상태 기본값 준비 ──
+# year_idx: 연도 선택박스에 key를 쓰지 않고 직접 관리합니다.
+#           (자동재생 기능에서 스크립트 중간에 값을 바꿔야 하는데,
+#            key가 달린 위젯은 이미 화면에 그려진 뒤에는 값을 바꿀 수 없기 때문입니다)
+if "year_idx" not in st.session_state:
+    st.session_state.year_idx = latest_idx
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+if "sido_sel" not in st.session_state:
+    st.session_state.sido_sel = "전체"
+if "sigungu_sel" not in st.session_state:
+    st.session_state.sigungu_sel = "(선택 안 함)"
+if "last_clicked_code" not in st.session_state:
+    st.session_state.last_clicked_code = None
+
+
+# ── 지도를 클릭했을 때: 이전 실행에서 남은 클릭 정보를 읽어서 반영 ──
+# (지도는 화면 아래쪽에서 그려지지만, 그 클릭 결과를 사이드바 선택박스에
+#  반영하려면 선택박스를 만들기 '전'인 지금 시점에 처리해야 합니다)
+def apply_map_click():
+    click_state = st.session_state.get("map_chart")
+    if not click_state:
+        return
+    points = click_state.get("selection", {}).get("points", [])
+    if not points:
+        return
+    code = points[0].get("location")
+    if not code or code == st.session_state.last_clicked_code:
+        return  # 이미 처리한 클릭이면 무시 (무한 반복 방지)
+    st.session_state.last_clicked_code = code
+    match = names[names["시군구코드"] == code]
+    if not match.empty:
+        st.session_state.sido_sel = match.iloc[0]["시도"]
+        st.session_state.sigungu_sel = match.iloc[0]["시군구"]
+
+
+apply_map_click()
+
+
+# ── 초기화 버튼 콜백 ──
+def reset_filters():
+    st.session_state.year_idx = latest_idx
+    st.session_state.sido_sel = "전체"
+    st.session_state.sigungu_sel = "(선택 안 함)"
+    st.session_state.playing = False
+    st.session_state.last_clicked_code = None
+    st.session_state.pop("map_chart", None)
+
+
+# ── 재생/정지 버튼 콜백 ──
+def toggle_playing():
+    st.session_state.playing = not st.session_state.playing
+
+
+# ── 사이드바 ──
 st.sidebar.header("🔎 조건 선택")
+st.sidebar.button("🔄 초기화", on_click=reset_filters, width="stretch")
 
-selected_year = st.sidebar.selectbox("① 연도 선택", years, index=len(years) - 1)
+play_label = "⏸ 정지" if st.session_state.playing else "▶ 연도 자동 재생"
+st.sidebar.button(play_label, on_click=toggle_playing, width="stretch")
+
+selected_year = st.sidebar.selectbox(
+    "① 연도 선택", years, index=st.session_state.year_idx
+)
+# 사용자가 직접 선택박스를 바꾼 경우 year_idx도 같이 맞춰줍니다
+if selected_year != years[st.session_state.year_idx]:
+    st.session_state.year_idx = years.index(selected_year)
 
 sido_list = ["전체"] + sorted(names["시도"].dropna().unique().tolist())
-selected_sido = st.sidebar.selectbox("② 시도 선택", sido_list)
+selected_sido = st.sidebar.selectbox("② 시도 선택", sido_list, key="sido_sel")
 
 # 선택한 연도의 데이터만 꺼내기
 merged = all_years[all_years["연도"] == selected_year].copy()
@@ -93,9 +157,12 @@ if selected_sido != "전체":
 else:
     view_geojson = geojson
 
-# 시군구 검색 (박스에 이름을 타이핑하면 목록이 자동으로 좁혀집니다)
+# 시군구 검색 목록 (시도 필터에 맞춰 자동으로 좁혀집니다)
 sigungu_options = ["(선택 안 함)"] + sorted(merged["시군구"].dropna().unique().tolist())
-selected_sigungu = st.sidebar.selectbox("③ 시군구 검색", sigungu_options)
+# 이전에 골랐던 시군구가 지금 목록에 없으면(예: 시도를 바꿔서) 안전하게 초기화
+if st.session_state.sigungu_sel not in sigungu_options:
+    st.session_state.sigungu_sel = "(선택 안 함)"
+selected_sigungu = st.sidebar.selectbox("③ 시군구 검색", sigungu_options, key="sigungu_sel")
 
 # 5단계 색 구간 (전국 시군구를 다섯 덩어리로 나눈 실제 경계값)
 BINS = [0, 19, 23, 28, 38, 100]
@@ -131,23 +198,36 @@ fig.update_layout(
     plot_bgcolor="#eef4fa",
 )
 
-st.info("💡 지도 위에서는 마우스 휠을 굴려도 확대되지 않아요. 편하게 스크롤해서 아래 내용을 보세요.")
+# on_select="rerun" → 지도를 클릭하면 그 클릭 정보가 담겨 화면이 다시 그려집니다
+# (마우스 휠은 기본 동작 그대로 두어서, 지도 위에서는 확대/축소가 됩니다)
+st.plotly_chart(
+    fig,
+    width="stretch",
+    on_select="rerun",
+    selection_mode="points",
+    key="map_chart",
+)
 
-# config={"scrollZoom": False} → 지도 위에서 마우스 휠을 굴렸을 때
-# 지도가 확대되지 않고 페이지가 자연스럽게 스크롤되도록 막아줍니다
-st.plotly_chart(fig, width="stretch", config={"scrollZoom": False})
-
-# 지도 아래 순위 표 두 개
+# 지도 아래 순위 표 두 개 (순위 번호 포함)
 c1, c2 = st.columns(2)
 cols = ["시도", "시군구", "고령화율"]
+
+top10 = merged.nlargest(10, "고령화율")[cols].reset_index(drop=True)
+top10.index = top10.index + 1
+top10.index.name = "순위"
+
+bottom10 = merged.nsmallest(10, "고령화율")[cols].reset_index(drop=True)
+bottom10.index = bottom10.index + 1
+bottom10.index.name = "순위"
+
 with c1:
     st.subheader("🔴 고령화율 높은 곳 10")
-    st.dataframe(merged.nlargest(10, "고령화율")[cols].reset_index(drop=True))
+    st.dataframe(top10, width="stretch")
 with c2:
     st.subheader("🟢 고령화율 낮은 곳 10")
-    st.dataframe(merged.nsmallest(10, "고령화율")[cols].reset_index(drop=True))
+    st.dataframe(bottom10, width="stretch")
 
-# ── 검색한 시군구 상세 정보 ──
+# ── 검색한(또는 지도에서 클릭한) 시군구 상세 정보 ──
 if selected_sigungu != "(선택 안 함)":
     st.divider()
     st.subheader(f"📍 {selected_sigungu} 상세 정보")
@@ -160,7 +240,7 @@ if selected_sigungu != "(선택 안 함)":
     m2.metric("전체 인구", f"{int(row['전체인구']):,}명")
     m3.metric("65세 이상 인구", f"{int(row['고령인구']):,}명")
 
-    # 이 지역의 연도별(2015~2026) 고령화율 변화 추이
+    # 이 지역의 연도별 고령화율 변화 추이
     trend = all_years[all_years["시군구코드"] == code].sort_values("연도")
     trend_fig = px.line(
         trend,
@@ -173,3 +253,12 @@ if selected_sigungu != "(선택 안 함)":
     )
     trend_fig.update_layout(height=350, margin=dict(l=0, r=0, t=40, b=0))
     st.plotly_chart(trend_fig, width="stretch")
+
+# ── 연도 자동 재생: 마지막에 처리해서, 현재 화면을 다 보여준 뒤 다음 연도로 넘어갑니다 ──
+if st.session_state.playing:
+    time.sleep(1.2)
+    if st.session_state.year_idx < latest_idx:
+        st.session_state.year_idx += 1
+    else:
+        st.session_state.playing = False  # 마지막 연도까지 갔으면 자동으로 정지
+    st.rerun()
