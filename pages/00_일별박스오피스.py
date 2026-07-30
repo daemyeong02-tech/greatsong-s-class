@@ -10,6 +10,7 @@ st.title("🎬 어제의 박스오피스")
 
 # 비밀 금고에서 인증키 꺼내기 (코드에는 키를 적지 않는다)
 KOBIS_KEY = st.secrets["KOBIS_KEY"]
+KAKAO_API_KEY = st.secrets.get("KAKAO_API_KEY", "")
 
 KST = ZoneInfo("Asia/Seoul")
 today_kst = datetime.now(KST).date()
@@ -138,3 +139,54 @@ for _, row in table.iterrows():
     cols[1].link_button("CGV", cgv_url)
     cols[2].link_button("롯데시네마", lotte_url)
     cols[3].link_button("메가박스", megabox_url)
+
+# --- 주변 영화관 찾기 (카카오 로컬 API) ---
+st.subheader("📍 주변 영화관 찾기")
+
+if not KAKAO_API_KEY:
+    st.info("카카오 REST API 키가 설정되지 않았습니다. `st.secrets`에 KAKAO_API_KEY를 추가하면 이 기능을 쓸 수 있습니다.")
+else:
+    st.caption("브라우저 위치 권한 없이, 입력한 동네·주소 근처의 영화관을 검색합니다.")
+    location_query = st.text_input("내 위치 (동네·주소·지하철역 등)", placeholder="예: 군산시 나운동")
+
+    @st.cache_data(ttl=600)
+    def fetch_nearby_theaters(query: str, api_key: str) -> dict:
+        url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+        headers = {"Authorization": f"KakaoAK {api_key}"}
+        params = {"query": f"{query} 영화관", "size": 15, "sort": "accuracy"}
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res.raise_for_status()
+        return res.json()
+
+    if location_query:
+        with st.spinner("주변 영화관을 검색하는 중..."):
+            try:
+                theater_data = fetch_nearby_theaters(location_query, KAKAO_API_KEY)
+            except requests.exceptions.HTTPError:
+                st.error("카카오 API 요청이 실패했습니다. API 키가 올바른지 확인해 주세요.")
+                theater_data = None
+            except requests.exceptions.RequestException as e:
+                st.error(f"카카오 서버에 연결할 수 없습니다: {e}")
+                theater_data = None
+
+        if theater_data is not None:
+            theaters = theater_data.get("documents", [])
+            # 키워드에 '영화관'이 들어가도 관련 없는 업체가 섞여 나올 수 있어 카테고리로 한 번 더 거른다
+            theaters = [t for t in theaters if "영화" in t.get("category_name", "")]
+
+            if not theaters:
+                st.warning("근처에서 영화관을 찾지 못했습니다. 지역명을 다르게 입력해 보세요.")
+            else:
+                for t in theaters:
+                    name = t.get("place_name", "")
+                    address = t.get("road_address_name") or t.get("address_name", "")
+                    phone = t.get("phone") or "전화번호 정보 없음"
+                    place_url = t.get("place_url", "")
+
+                    cols = st.columns([3, 1])
+                    with cols[0]:
+                        st.write(f"**{name}**")
+                        st.caption(f"{address} · {phone}")
+                    with cols[1]:
+                        if place_url:
+                            st.link_button("지도 보기", place_url)
